@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scanner import get_all_drivers, extract_pci_vendor
-from catalog import batch_search
+from catalog import search_drivers
 from downloader import download_drivers, ensure_download_dir
 from installer import check_admin_or_continue, install_drivers
 
@@ -321,14 +321,14 @@ class DriverUpdaterApp:
             catalog_results = []
             if search_ids:
                 try:
-                    catalog_results = batch_search(search_ids, max_per_query=3)
+                    catalog_results = search_drivers(search_ids)
                 except Exception as e:
                     self.root.after(0, lambda: self._log(
-                        f"  ⚠️ Erro no Catalog: {e}"
+                        f"  ⚠️ Erro na busca: {e}"
                     ))
 
                 self.root.after(0, lambda: self._log(
-                    f"  Encontrados {len(catalog_results)} drivers no Catalog"
+                    f"  Encontrados {len(catalog_results)} drivers disponíveis"
                 ))
             else:
                 self.root.after(0, lambda: self._log(

@@ -1,54 +1,203 @@
 """
-catalog.py — Consulta Microsoft Update Catalog por hardware ID
+catalog.py — Busca drivers usando Windows Update API (COM) e Microsoft Catalog como fallback
 """
 import re
-import requests
 import time
-from urllib.parse import quote
+from typing import Callable
 
 
-MICROSOFT_CATALOG_URL = "https://www.catalog.update.microsoft.com/Search.aspx"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-
-def search_microsoft_catalog(query: str, max_results: int = 10) -> list[dict]:
+def search_windows_update(hardware_ids: list[str]) -> list[dict]:
     """
-    Busca drivers no Microsoft Update Catalog.
-    Retorna lista de dicts: title, size, url, date, id
+    Usa Windows Update API (COM) pra buscar drivers.
+    Funciona APENAS no Windows.
+    Retorna lista de dicts com: title, size, date, download_id, hardware_id
     """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-
-    params = {"q": query}
+    try:
+        import comtypes.client
+        import comtypes.gen
+        from comtypes.gen import UpdateApiLib
+    except ImportError:
+        return _search_catalog_fallback(hardware_ids)
+    except Exception:
+        return _search_catalog_fallback(hardware_ids)
 
     try:
-        resp = requests.get(
-            MICROSOFT_CATALOG_URL,
-            params=params,
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return [{"error": f"Erro ao consultar catalog: {e}"}]
+        # Inicializa a sessão do Windows Update
+        session = comtypes.client.CreateObject("Microsoft.Update.Session")
+        searcher = session.CreateUpdateSearcher()
 
-    return _parse_catalog_results(resp.text, max_results)
+        # Filtra por drivers
+        searcher.Online = False  # Usa cache local primeiro
+        results = []
+
+        for hid in hardware_ids[:10]:  # Limita a 10
+            try:
+                query = f"Driver=1 and HardwareID='{hid}'"
+                search_result = searcher.Search(query)
+
+                for update in search_result.Updates:
+                    title = update.Title
+                    size = update.MaxDownloadSize
+                    date = str(update.LastDeploymentChangeTime)[:10] if update.LastDeploymentChangeTime else ""
+
+                    results.append({
+                        "title": title,
+                        "size": size,
+                        "size_str": _format_size(size),
+                        "date": date,
+                        "download_id": "",
+                        "hardware_id": hid,
+                        "source": "Windows Update",
+                        "update_obj": update,
+                    })
+
+            except Exception:
+                continue
+
+        if results:
+            return results
+
+        # Se não achou local, tenta online
+        searcher.Online = True
+        for hid in hardware_ids[:5]:
+            try:
+                query = f"Driver=1 and HardwareID='{hid}'"
+                search_result = searcher.Search(query)
+                for update in search_result.Updates:
+                    title = update.Title
+                    size = update.MaxDownloadSize
+                    date = str(update.LastDeploymentChangeTime)[:10] if update.LastDeploymentChangeTime else ""
+                    results.append({
+                        "title": title,
+                        "size": size,
+                        "size_str": _format_size(size),
+                        "date": date,
+                        "download_id": "",
+                        "hardware_id": hid,
+                        "source": "Windows Update",
+                        "update_obj": update,
+                    })
+            except Exception:
+                continue
+
+        return results
+
+    except Exception:
+        return _search_catalog_fallback(hardware_ids)
+
+
+def _search_catalog_fallback(hardware_ids: list[str]) -> list[dict]:
+    """
+    Fallback: busca no Microsoft Catalog via scraping.
+    """
+    try:
+        import requests
+        from urllib.parse import quote
+    except ImportError:
+        return [{"error": "requests não instalado"}]
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    results = []
+    seen_titles = set()
+
+    for hid in hardware_ids[:10]:
+        try:
+            resp = requests.get(
+                "https://www.catalog.update.microsoft.com/Search.aspx",
+                params={"q": hid},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+        except Exception:
+            continue
+
+        # Extrai resultados da tabela HTML
+        rows = re.findall(
+            r'<tr[^>]*class=".*?resultRow.*?"[^>]*>(.*?)</tr>',
+            resp.text, re.DOTALL
+        )
+
+        for row in rows[:5]:
+            title_match = re.search(
+                r'<a[^>]*class=".*?updateTitle.*?"[^>]*>(.*?)</a>',
+                row, re.DOTALL
+            )
+            title = title_match.group(1).strip() if title_match else ""
+            if not title:
+                # Tenta outro padrão
+                title_match = re.search(
+                    r'<a[^>]*>(.*?)</a>', row, re.DOTALL
+                )
+                title = title_match.group(1).strip() if title_match else ""
+
+            if not title or title.lower() in seen_titles:
+                continue
+            seen_titles.add(title.lower())
+
+            # Tamanho
+            size_match = re.search(
+                r'([\d.,]+\s*(?:KB|MB|GB))', row, re.DOTALL
+            )
+            size_str = size_match.group(1).strip() if size_match else "N/A"
+            size_bytes = _parse_size(size_str)
+
+            # Data
+            date_match = re.search(
+                r'(\d{1,2}/\d{1,2}/\d{4})', row
+            )
+            date = date_match.group(1) if date_match else ""
+
+            # Download ID
+            dl_match = re.search(
+                r"javascript:download\(['\"](\d+)['\"]", row
+            )
+            dl_id = dl_match.group(1) if dl_match else ""
+
+            results.append({
+                "title": title.strip(),
+                "size": size_bytes,
+                "size_str": size_str,
+                "date": date,
+                "download_id": dl_id,
+                "hardware_id": hid,
+                "source": "Microsoft Catalog",
+            })
+
+        time.sleep(0.3)  # Rate limiting
+
+    if not results:
+        results.append({
+            "title": "Nenhum driver encontrado no Windows Update ou Catalog",
+            "size": 0,
+            "size_str": "0 B",
+            "date": "",
+            "download_id": "",
+            "hardware_id": "",
+            "source": "N/A",
+        })
+
+    return results
+
+
+def search_drivers(hardware_ids: list[str]) -> list[dict]:
+    """
+    Função principal: tenta Windows Update API, fallback Catalog.
+    """
+    return search_windows_update(hardware_ids)
 
 
 def _parse_size(text: str) -> int:
-    """Converte string de tamanho (ex: '1.5 MB') pra bytes."""
     text = text.strip().upper()
     m = re.search(r'([\d.]+)\s*(KB|MB|GB)', text)
     if not m:
         return 0
-
     val = float(m.group(1))
     unit = m.group(2)
     if unit == "KB":
@@ -61,7 +210,6 @@ def _parse_size(text: str) -> int:
 
 
 def _format_size(bytes_val: int) -> str:
-    """Formata bytes pra string legível."""
     if bytes_val >= 1024 * 1024 * 1024:
         return f"{bytes_val / (1024*1024*1024):.1f} GB"
     elif bytes_val >= 1024 * 1024:
@@ -71,119 +219,9 @@ def _format_size(bytes_val: int) -> str:
     return f"{bytes_val} B"
 
 
-def _parse_catalog_results(html: str, max_results: int) -> list[dict]:
-    """
-    Parseia o HTML de resultados do Microsoft Catalog.
-    Extrai tabela de resultados com títulos, links de download, tamanhos.
-    """
-    results = []
-
-    # Procura tabela de resultados
-    # O Catalog renderiza uma table#ctl00_catalogBody_ResultsGrid
-    table_pattern = r'<table[^>]*id="ctl00_catalogBody_ResultsGrid"[^>]*>.*?</table>'
-    table_match = re.search(table_pattern, html, re.DOTALL | re.IGNORECASE)
-    if not table_match:
-        # Tenta pattern alternativo
-        table_match = re.search(r'class="catalog-table".*?<table.*?>.*?</table>', html, re.DOTALL)
-
-    # Extrai linhas da tabela
-    row_pattern = r'<tr[^>]*>(.*?)</tr>'
-    if table_match:
-        rows = re.findall(row_pattern, table_match.group(0), re.DOTALL)
-    else:
-        # Fallback: procura qualquer padrão de resultado
-        rows = re.findall(r'class=".*?resultRow.*?".*?>(.*?)</tr>', html, re.DOTALL)
-
-    for row in rows:
-        if len(results) >= max_results:
-            break
-
-        # Título
-        title_match = re.search(r'<a[^>]*class=".*?updateTitle.*?"[^>]*>(.*?)</a>', row, re.DOTALL)
-        title = title_match.group(1).strip() if title_match else ""
-
-        if not title:
-            continue
-
-        # Tamanho
-        size_match = re.search(r'class=".*?sizeCol.*?"[^>]*>\s*([\d.,]+\s*(?:KB|MB|GB))', row, re.DOTALL)
-        size_str = size_match.group(1).strip() if size_match else "0 B"
-        size_bytes = _parse_size(size_str)
-
-        # Data
-        date_match = re.search(r'class=".*?dateCol.*?"[^>]*>\s*(\d{1,2}/\d{1,2}/\d{4})', row, re.DOTALL)
-        date = date_match.group(1).strip() if date_match else ""
-
-        # Link de download (o catalog gera onclick dinâmico)
-        download_match = re.search(
-            r"javascript:download\(['\"](\d+)['\"]", row, re.DOTALL
-        )
-        download_id = download_match.group(1) if download_match else ""
-
-        # Tenta extrair link direto
-        link_match = re.search(r'<a[^>]*href="(.*?)"[^>]*>.*?</a>', row, re.DOTALL)
-        url = link_match.group(1) if link_match else ""
-
-        results.append({
-            "title": title,
-            "size": size_bytes,
-            "size_str": _format_size(size_bytes),
-            "date": date,
-            "download_id": download_id,
-            "url": url,
-            "source": "Microsoft Catalog",
-        })
-
-    # Se não encontrou nada via parsing, retorna info
-    if not results:
-        results.append({
-            "title": f"Consulte manualmente: {MICROSOFT_CATALOG_URL}?q=...",
-            "size": 0,
-            "size_str": "N/A",
-            "date": "",
-            "download_id": "",
-            "url": MICROSOFT_CATALOG_URL,
-            "source": "Microsoft Catalog",
-            "manual": True,
-        })
-
-    return results
-
-
-def search_driver(query: str) -> list[dict]:
-    """
-    Busca drivers para um hardware ID específico.
-    """
-    return search_microsoft_catalog(query)
-
-
-def batch_search(hardware_ids: list[str], max_per_query: int = 5) -> list[dict]:
-    """
-    Busca drivers para múltiplos hardware IDs.
-    Limita a max_per_query por busca pra não floodar.
-    """
-    all_results = []
-    seen_titles = set()
-    limited_ids = hardware_ids[:20]  # Máximo de 20 IDs pra não demorar
-
-    for hid in limited_ids:
-        results = search_microsoft_catalog(hid, max_results=3)
-        time.sleep(0.5)  # Rate limiting
-
-        for r in results:
-            title_lower = r.get("title", "").lower()
-            if title_lower and title_lower not in seen_titles:
-                seen_titles.add(title_lower)
-                r["hardware_id"] = hid
-                all_results.append(r)
-
-    return all_results
-
-
 if __name__ == "__main__":
     import sys
-    query = sys.argv[1] if len(sys.argv) > 1 else "PCI\\VEN_10DE"
-    print(f"Buscando: {query}")
-    results = search_driver(query)
-    for r in results[:10]:
-        print(f"  [{r.get('size_str','?')}] {r['title'][:80]}")
+    ids = sys.argv[1:] if len(sys.argv) > 1 else ["PCI\\VEN_10DE&DEV_1C03"]
+    results = search_drivers(ids)
+    for r in results:
+        print(f"  [{r.get('source','?')}] {r.get('title','?')[:80]}")
