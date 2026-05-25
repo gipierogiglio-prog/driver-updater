@@ -281,12 +281,12 @@ class DriverUpdaterApp:
     def _scan_worker(self):
         try:
             data = get_all_drivers()
-            third_party = data["third_party"]
+            all_drivers = data["all_drivers"]
             problems = data["problem_devices"]
             hw_ids = data["hardware_ids"]
 
             self.root.after(0, lambda: self._log(
-                f"  Drivers terceiros: {len(third_party)}"
+                f"  Drivers instalados: {data['all_count']} (total)"
             ))
             self.root.after(0, lambda: self._log(
                 f"  Dispositivos com problema: {len(problems)}"
@@ -310,7 +310,7 @@ class DriverUpdaterApp:
 
             # Pega alguns hardware IDs pra busca
             search_ids = []
-            for hid in hw_ids[:10]:  # Limita a 10 pra não floodar
+            for hid in hw_ids[:15]:  # Limita a 15 pra não floodar
                 ven = extract_pci_vendor(hid)
                 if ven:
                     search_ids.append(hid)
@@ -318,45 +318,63 @@ class DriverUpdaterApp:
             # Remove duplicatas
             search_ids = list(dict.fromkeys(search_ids))
 
+            catalog_results = []
             if search_ids:
-                catalog_results = batch_search(search_ids, max_per_query=3)
+                try:
+                    catalog_results = batch_search(search_ids, max_per_query=3)
+                except Exception as e:
+                    self.root.after(0, lambda: self._log(
+                        f"  ⚠️ Erro no Catalog: {e}"
+                    ))
+
                 self.root.after(0, lambda: self._log(
                     f"  Encontrados {len(catalog_results)} drivers no Catalog"
                 ))
             else:
-                catalog_results = []
                 self.root.after(0, lambda: self._log(
                     "  Nenhum hardware ID PCI encontrado para busca"
                 ))
 
-            # Monta lista final de drivers
+            # Cria lookup de hardware IDs por nome de driver
+            driver_hw = {}
+            for d in all_drivers:
+                name_key = d["name"].lower().strip()
+                driver_hw[name_key] = d["hardware_id"]
+
+            # Monta lista: APENAS drivers que têm atualização no Catalog
             self.drivers = []
             self.selected = {}
 
-            for d in third_party:
-                self.drivers.append({
-                    "name": d["name"],
-                    "provider": d["provider"],
-                    "version": d["version"],
-                    "date": d["date"],
-                    "hardware_id": d["hardware_id"],
-                    "size_str": "N/A",
-                    "size": 0,
-                    "status": "identificado",
-                    "filepath": None,
-                    "install_result": None,
-                })
-
             for cr in catalog_results:
-                # Verifica se já não existe
-                existing_names = [d["name"] for d in self.drivers]
-                cr_title = cr.get("title", "")
-                if not any(cr_title[:30] in e for e in existing_names):
+                cr_title = cr.get("title", "")[:80]
+                cr_title_lower = cr_title.lower()
+
+                # Tenta achar o driver correspondente nos instalados
+                matched_name = cr_title
+                matched_provider = cr.get("source", "Microsoft Catalog")
+                matched_version = cr.get("date", "")
+                matched_hw = cr.get("hardware_id", "")
+
+                # Procura correspondência nos drivers instalados
+                for d in all_drivers:
+                    dn = d["name"].lower()
+                    # Se alguma parte do nome do driver bate com o título do Catalog
+                    if any(word in cr_title_lower for word in dn.split() if len(word) > 3):
+                        matched_name = d["name"]
+                        matched_provider = d["provider"]
+                        matched_version = d["version"]
+                        matched_hw = d["hardware_id"] or matched_hw
+                        break
+
+                # Evita duplicatas
+                existing = [d["catalog_title"] for d in self.drivers]
+                if cr_title not in existing:
                     self.drivers.append({
-                        "name": cr_title[:80],
-                        "provider": cr.get("source", "Microsoft Catalog"),
-                        "version": cr.get("date", ""),
-                        "hardware_id": cr.get("hardware_id", ""),
+                        "name": matched_name,
+                        "catalog_title": cr_title,
+                        "provider": matched_provider,
+                        "version": matched_version,
+                        "hardware_id": matched_hw,
                         "size_str": cr.get("size_str", "N/A"),
                         "size": cr.get("size", 0),
                         "status": "disponível",
@@ -408,9 +426,12 @@ class DriverUpdaterApp:
             else:
                 status_icon = "📦 Disponível" if d.get("download_id") else status
 
+            # Mostra o nome mais informativo: catalog_title > name
+            display_name = d.get("catalog_title", "") or d["name"]
+
             self.tree.insert("", tk.END, iid=str(i), values=(
                 selected,
-                d["name"],
+                display_name,
                 d.get("provider", ""),
                 d.get("version", ""),
                 d.get("size_str", "N/A"),

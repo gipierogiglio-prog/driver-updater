@@ -23,18 +23,54 @@ def _run_powershell(script: str) -> str:
         return ""
 
 
-def get_drivers_wmi() -> list[dict]:
+def _drivers_wmi_base(where_filter: str = "") -> list[dict]:
     """
-    Lista drivers de terceiros via WMI (Win32_PnPSignedDriver).
-    Retorna lista de dicts com: name, provider, version, date, hardware_id
+    Base para consulta WMI de drivers.
+    where_filter: cláusula WHERE adicional (ex: "-ne 'Microsoft'")
     """
-    ps_script = """
-    Get-CimInstance Win32_PnPSignedDriver | Where-Object {
-        $_.DeviceName -and $_.DriverProviderName -ne 'Microsoft'
-    } | Select-Object DeviceName, DriverProviderName, DriverVersion, DriverDate,
-        @{N='HardwareId';E={($_.HardwareID -join '; ')}}
+    ps_script = f"""
+    Get-CimInstance Win32_PnPSignedDriver | Where-Object {{
+        $_.DeviceName $where_filter
+    }} | Select-Object DeviceName, DriverProviderName, DriverVersion, DriverDate,
+        @{{N='HardwareId';E={{($_.HardwareID -join '; ')}}}}
     | ConvertTo-Json -Compress
     """
+    raw = _run_powershell(ps_script)
+    if not raw:
+        return []
+
+    try:
+        items = json.loads(raw)
+        if isinstance(items, dict):
+            items = [items]
+    except json.JSONDecodeError:
+        return []
+
+    drivers = []
+    for item in items:
+        drivers.append({{
+            "name": item.get("DeviceName", "Desconhecido"),
+            "provider": item.get("DriverProviderName", "N/A"),
+            "version": item.get("DriverVersion", "N/A"),
+            "date": str(item.get("DriverDate", "")).split(" ")[0] if item.get("DriverDate") else "N/A",
+            "hardware_id": item.get("HardwareId", ""),
+        }})
+
+    return drivers
+
+
+def get_drivers_wmi() -> list[dict]:
+    """
+    Lista APENAS drivers de terceiros (não Microsoft).
+    """
+    return _drivers_wmi_base(" -and $_.DriverProviderName -ne 'Microsoft' ")
+
+
+def get_all_drivers_wmi() -> list[dict]:
+    """
+    Lista TODOS os drivers (Microsoft + terceiros).
+    """
+    return _drivers_wmi_base(" ")
     raw = _run_powershell(ps_script)
     if not raw:
         return []
@@ -145,12 +181,16 @@ def extract_pci_device(hardware_id: str) -> str | None:
 def get_all_drivers() -> dict:
     """
     Retorna dict consolidado com:
-    - third_party: drivers de terceiros
+    - third_party: drivers de terceiros (não Microsoft)
+    - all_drivers: TODOS os drivers (Microsoft + terceiros)
     - problem_devices: dispositivos com erro
     - hardware_ids: todos os HW IDs
     """
+    all_drivers = get_all_drivers_wmi()
     return {
         "third_party": get_drivers_wmi(),
+        "all_drivers": all_drivers,
+        "all_count": len(all_drivers),
         "problem_devices": get_drivers_problem_devices(),
         "hardware_ids": get_hardware_ids(),
     }
